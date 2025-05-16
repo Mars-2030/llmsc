@@ -147,7 +147,7 @@ def run_simpy_simulation_entry( # Renamed to avoid conflict if old main had same
             if "environment_history" in results: # Check if this key exists in SimPy results
                 visualize_costs(results["environment_history"], output_folder, console)
                 # Bullwhip might also need data from results["environment_history"]
-                bullwhip_metrics = calculate_bullwhip_effect(results["environment_history"])
+                bullwhip_metrics = calculate_bullwhip_effect(results["environment_history"], num_regions)
                 # Display bullwhip_metrics if needed (see old main.py for example)
                 if bullwhip_metrics: # Check if metrics were successfully calculated
                     console.print("\n[bold cyan]Bullwhip Effect Ratios (Variance of Orders / Variance of Downstream Demand/Orders):[/]")
@@ -273,6 +273,7 @@ if __name__ == "__main__":
              exit(1)
         if not check_blockchain_config():
              console.print("[bold red]❌ Blockchain configuration incomplete in .env or ABI file missing. Halting.[/]")
+             console.print("[bold red]   Please ensure NODE_URL, CONTRACT_ADDRESS, BLOCKCHAIN_PRIVATE_KEY are set and ABI exists.[/]")
              exit(1)
         try:
             blockchain_interface_instance = BlockchainInterface(
@@ -283,6 +284,7 @@ if __name__ == "__main__":
             console.print(f"[bold green]✓ Connected to Ethereum node and loaded contract.[/]")
         except Exception as e:
             console.print(f"[bold red]❌ FATAL ERROR: Could not initialize Blockchain Interface: {e}[/]")
+            console.print("[bold red]   Check node connection, contract address, ABI path, and private key.[/]")
             console.print_exception()
             try: save_console_html(console, output_folder=output_folder, filename="simulation_error_report_simpy.html")
             except Exception as save_e: console.print(f"[red]Could not save error report: {save_e}[/]")
@@ -407,7 +409,7 @@ if __name__ == "__main__":
 
     # Bullwhip Effect
     if "environment_history" in sim_results:
-        bullwhip_metrics = calculate_bullwhip_effect(sim_results["environment_history"])
+        bullwhip_metrics = calculate_bullwhip_effect(sim_results["environment_history"], args.regions)
         if bullwhip_metrics:
             console.print("\n[bold cyan]Bullwhip Effect Ratios (Var(Orders)/Var(Demand)):[/]")
             bw_table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
@@ -427,12 +429,36 @@ if __name__ == "__main__":
         bc_metrics = blockchain_interface_instance.get_performance_metrics()
         perf_table = Table(title="Blockchain Interaction Summary", show_header=True, header_style="bold magenta", box=box.ROUNDED)
         perf_table.add_column("Metric", style="cyan", min_width=25); perf_table.add_column("Value", style="white", min_width=20)
-        # ... (populate table as in old main.py) ...
+        perf_table.add_row("[bold]Transactions[/]", "")
         perf_table.add_row("  Attempted Count", str(bc_metrics['tx_sent_count']))
         perf_table.add_row("  Successful Count", str(bc_metrics['tx_success_count']))
-        # ... Add all rows for blockchain perf table
+        perf_table.add_row("  Failed Count", str(bc_metrics['tx_failure_count']))
+        perf_table.add_row("  Success Rate", f"{bc_metrics['tx_success_rate']:.2f}%" if isinstance(bc_metrics['tx_success_rate'], float) else bc_metrics['tx_success_rate'])
+        perf_table.add_row("  Avg. Latency (s)", f"{bc_metrics['tx_latency_avg_s']:.4f}")
+        perf_table.add_row("  Max Latency (s)", f"{bc_metrics['tx_latency_max_s']:.4f}")
+        perf_table.add_row("  P95 Latency (s)", f"{bc_metrics['tx_latency_p95_s']:.4f}")
+        perf_table.add_row("  Total Gas Used", str(bc_metrics['total_gas_used']))
+        perf_table.add_row("  Avg Gas / Success Tx", f"{bc_metrics['avg_gas_per_successful_tx']:.0f}")
+        perf_table.add_row("  Last Tx Error", str(bc_metrics['last_tx_error']) if bc_metrics['last_tx_error'] else "None")
+        perf_table.add_row("[bold]Reads (Calls)[/]", "")
+        perf_table.add_row("  Attempted Count", str(bc_metrics['read_call_count']))
+        perf_table.add_row("  Failed Count", str(bc_metrics['read_error_count']))
+        perf_table.add_row("  Success Rate", f"{bc_metrics['read_success_rate']:.2f}%" if isinstance(bc_metrics['read_success_rate'], float) else bc_metrics['read_success_rate'])
+        perf_table.add_row("  Avg. Latency (s)", f"{bc_metrics['read_latency_avg_s']:.4f}")
+        perf_table.add_row("  Max Latency (s)", f"{bc_metrics['read_latency_max_s']:.4f}")
+        perf_table.add_row("  P95 Latency (s)", f"{bc_metrics['read_latency_p95_s']:.4f}")
+        perf_table.add_row("  Last Read Error", str(bc_metrics['last_read_error']) if bc_metrics['last_read_error'] else "None")
         console.print(perf_table)
         # Visualize Blockchain Performance already called if visualize is True
+               # --- Visualize Blockchain Performance ---
+
+        visualize_blockchain_performance(
+            blockchain_interface=blockchain_interface_instance,
+            output_folder=output_folder,
+            console=console
+        )
+    elif args.use_blockchain:
+        console.print(Panel("[yellow]Blockchain Performance Metrics Not Available (Initialization Failed)[/]", border_style="yellow", expand=False))
 
     # Query Final Blockchain State (same as before)
     if actual_use_blockchain_flag and blockchain_interface_instance:

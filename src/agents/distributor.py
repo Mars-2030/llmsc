@@ -120,7 +120,7 @@ Current observation (JSON string, refers to 'obs_clean' in scratchpad):
 
 Your Process:
 1. Review current inventory (`obs_clean.inventories`), inbound pipeline (`obs_clean.inbound_pipeline`), and recent orders from your hospital (`obs_clean.recent_orders`).
-2. Analyze your hospital's situation: projected demand, case trends (`obs_clean.epidemiological_data`), stockout days (`obs_clean.hospital_stockout_summary`), and patient impact (`obs_clean.my_region_patient_impact_score`).
+2. Analyze your hospital's situation: projected demand, case trends (`obs_clean.epidemiological_data`), stockout days (`obs_clean.hospital_stockout_summary`), and patient impact (`obs_clean.my_region_patient_impact_score`). Key pre-calculated demand signals for your ordering decision are `obs_clean.dist_obs_demand_over_planning_horizon` and `obs_clean.dist_obs_avg_daily_demand_in_horizon`.
 3. If a drug is critical for your hospital (low stock, high demand/impact), use `get_criticality_assessment` (pass `drug_id`).
 4. Determine order quantities to send to the Manufacturer (`distributor_orders`) using the logic in Step 6 of the scratchpad.
 5. Determine allocation quantities to send to your Hospital (`distributor_allocation`) using the logic in Step 7 of the scratchpad.
@@ -146,9 +146,7 @@ For order_event in obs_clean.recent_orders:
 
 # --- Step 6: Ordering (from Manufacturer) - FOCUSED ON STABLE SUPPLY & FORECASTED NEEDS ---
 `distributor_orders` = {{}}
-`ORDER_LEAD_TIME_DAYS` = 5 # Assumed average lead time from manufacturer
-`ORDER_REVIEW_PERIOD_DAYS` = 1 # Daily review
-`PLANNING_HORIZON_ORDER_DAYS` = `ORDER_LEAD_TIME_DAYS` + `ORDER_REVIEW_PERIOD_DAYS` # = 6
+`PLANNING_HORIZON_ORDER_DAYS` = 6 # Based on assumed 5-day lead time + 1-day review period.
 `SAFETY_STOCK_TARGET_DAYS_ORDER_CALC` = 7 # Base safety stock in days of demand
 `MAX_ORDER_AS_MULTIPLE_OF_HORIZON_DEMAND` = 2.5
 `MIN_ORDER_QTY_IF_NEEDED_BASE_FACTOR` = 0.2 # Min order as factor of avg daily demand in horizon
@@ -167,10 +165,10 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
 
     `current_safety_stock_days` = min(max(3, `current_safety_stock_days`), 15) # Bound safety stock days
 
-    `hosp_fcst_relevant_period` = `hosp_demand_forecast_list[d_id_str]`[:`PLANNING_HORIZON_ORDER_DAYS`]
-    if not `hosp_fcst_relevant_period`: `hosp_fcst_relevant_period` = [`hosp_proj_demand_today[d_id_str]`] * `PLANNING_HORIZON_ORDER_DAYS` # Fallback
-    `demand_over_planning_horizon` = sum(`hosp_fcst_relevant_period`)
-    `avg_daily_demand_in_horizon` = `demand_over_planning_horizon` / max(1, len(`hosp_fcst_relevant_period`))
+    # *** USE PRE-CALCULATED DEMAND SIGNALS FROM OBSERVATION ***
+    `demand_over_planning_horizon` = float(obs_clean.dist_obs_demand_over_planning_horizon.get(d_id_str, 0.0))
+    `avg_daily_demand_in_horizon` = float(obs_clean.dist_obs_avg_daily_demand_in_horizon.get(d_id_str, 0.0))
+    # *** END PRE-CALCULATED USAGE ***
     
     `safety_stock_units` = `avg_daily_demand_in_horizon` * `current_safety_stock_days`
     `order_up_to_level` = `demand_over_planning_horizon` + `safety_stock_units`
@@ -187,8 +185,8 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
 
 # --- Step 7: Allocation (to My Hospital) ---
 `distributor_allocation` = {{}}
-`ALLOC_SAFETY_STOCK_DAYS_HOSP` = 2.0 # How many days of hospital's demand to keep as safety for them at MY level (influences my allocation)
-`MAX_ALLOC_MULTIPLE_OF_DEMAND` = 2.5 # Max to allocate as multiple of today's projected demand
+`ALLOC_SAFETY_STOCK_DAYS_HOSP` = 2.0 
+`MAX_ALLOC_MULTIPLE_OF_DEMAND` = 2.5 
 
 For each `d_id_str` in `obs_clean.drug_info.keys()`:
     `current_inv_for_alloc` = `my_inv[d_id_str]`
@@ -197,8 +195,7 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
     `hosp_demand_today_alloc` = `hosp_proj_demand_today[d_id_str]`
     `sum_recent_hosp_orders` = sum(`recent_hosp_orders_for_drug[d_id_str]`) if `recent_hosp_orders_for_drug[d_id_str]` else 0.0
     
-    // Base allocation on max of today's demand or recent orders
-    `base_alloc_need` = max(`hosp_demand_today_alloc`, `sum_recent_hosp_orders` * 0.5) # Factor down sum of recent orders a bit
+    `base_alloc_need` = max(`hosp_demand_today_alloc`, `sum_recent_hosp_orders` * 0.5) 
 
     `alloc_urgency_multiplier` = 1.0
     if `hosp_stockout_days[d_id_str]` > 1: `alloc_urgency_multiplier` = 2.0
@@ -208,16 +205,14 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
     
     `target_allocation` = `base_alloc_need` * `alloc_urgency_multiplier`
     
-    // Ensure I try to keep some safety stock for the hospital's *next few days* if possible
-    `hosp_next_3day_demand_forecast` = sum(`hosp_demand_forecast_list[d_id_str]`[:3]) # Uses the 7-day forecast from obs
-    `desired_buffer_for_hosp_at_my_level` = `hosp_next_3day_demand_forecast` * (`ALLOC_SAFETY_STOCK_DAYS_HOSP` / 3.0) # Pro-rata safety based on 3 days
+    `hosp_next_3day_demand_forecast` = sum(`hosp_demand_forecast_list[d_id_str]`[:3]) 
+    `desired_buffer_for_hosp_at_my_level` = `hosp_next_3day_demand_forecast` * (`ALLOC_SAFETY_STOCK_DAYS_HOSP` / 3.0) 
     
-    // Amount to allocate = target_allocation, but capped by what I have minus what I want to keep as buffer for hospital
     `max_can_send_while_keeping_buffer` = `current_inv_for_alloc` - `desired_buffer_for_hosp_at_my_level`
     
     `final_allocation_amount` = min(`target_allocation`, max(0.0, `max_can_send_while_keeping_buffer`))
-    `final_allocation_amount` = min(`final_allocation_amount`, `hosp_demand_today_alloc` * `MAX_ALLOC_MULTIPLE_OF_DEMAND`) // Cap
-    `final_allocation_amount` = min(`final_allocation_amount`, `current_inv_for_alloc`) // Absolute cap by my inventory
+    `final_allocation_amount` = min(`final_allocation_amount`, `hosp_demand_today_alloc` * `MAX_ALLOC_MULTIPLE_OF_DEMAND`) 
+    `final_allocation_amount` = min(`final_allocation_amount`, `current_inv_for_alloc`) 
 
     if `final_allocation_amount` > 0.01:
         `distributor_allocation[d_id_str]` = round(max(0.0, `final_allocation_amount`))

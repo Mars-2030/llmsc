@@ -238,19 +238,19 @@ def format_observation_for_agent(
                 obs["downstream_inventory_summary"][str(d_id)]["distributor"] += sim.dist_inv_stores[(r_id, d_id)].level
                 obs["downstream_inventory_summary"][str(d_id)]["hospital"] += sim.hosp_inv_stores[(r_id, d_id)].level
 
-                for day_offset_prod in range(1, 8):
+                for day_offset_prod in range(1, 8): # 7-day forecast starting from next day
                     fcst_day_prod = current_day + day_offset_prod
                     demand_val = sim.scenario.get_daily_drug_demand(fcst_day_prod, r_id, d_id) if fcst_day_prod < sim.duration_days else 0.0
-                    if r_id == 0: # Initialize list for drug_id only once
+                    if r_id == 0: 
                          obs["total_downstream_demand_forecast"][str(d_id)].append(demand_val)
-                    else: # Sum up for other regions
+                    else: 
                          if len(obs["total_downstream_demand_forecast"][str(d_id)]) > day_offset_prod -1:
                             obs["total_downstream_demand_forecast"][str(d_id)][day_offset_prod-1] += demand_val
-                         else: # Should not happen if initialized correctly
+                         else: 
                             obs["total_downstream_demand_forecast"][str(d_id)].append(demand_val)
 
 
-                for day_offset_alloc in range(0, 3):
+                for day_offset_alloc in range(0, 3): # 3-day forecast starting from current day
                     fcst_day_alloc = current_day + day_offset_alloc
                     demand_val_alloc = sim.scenario.get_daily_drug_demand(fcst_day_alloc, r_id, d_id) if fcst_day_alloc < sim.duration_days else 0.0
                     obs["regional_hospital_demand_forecast"][str(d_id)][str(r_id)].append(demand_val_alloc)
@@ -264,16 +264,71 @@ def format_observation_for_agent(
         obs["pending_releases"] = [
             {"drug_id": str(entry["drug_id"]), "amount": entry["amount_produced"],
              "production_day": entry["day"], "days_in_warehouse": current_day - entry["day"],
-             "expected_release_day": entry["day"] + sim.warehouse_release_delay} # Ensure this is integer day
+             "expected_release_day": entry["day"] + sim.warehouse_release_delay} 
             for entry in sim.production_history
             if not entry.get("released", False)
         ]
+
+        # --- Populate `recent_distributor_orders_by_drug` (for Manufacturer's allocation scratchpad) ---
         obs["recent_distributor_orders_by_drug"] = defaultdict(lambda: defaultdict(list))
+        current_day_int_for_filter = int(current_day) 
         for order in sim.order_history:
-            if order["to_id"] == 0 and order["day"] >= current_day - 3:
-                dist_region_id = order["from_id"] - 1
-                obs["recent_distributor_orders_by_drug"][str(order["drug_id"])][str(dist_region_id)].append(order["amount"])
+            # Filter for orders TO manufacturer (to_id == 0) and within the last 3 days (for allocation needs context)
+            if order.get("to_id") == 0 and order.get("day", -1) >= current_day_int_for_filter - 3:
+                try:
+                    dist_region_id = order["from_id"] - 1 # from_id for distributor is region_id + 1
+                    drug_id_str = str(order["drug_id"])
+                    amount = float(order["amount"])
+                    # Ensure dist_region_id is valid before using as key
+                    if 0 <= dist_region_id < sim.num_regions:
+                         obs["recent_distributor_orders_by_drug"][drug_id_str][str(dist_region_id)].append(amount)
+                    elif console_to_use:
+                         console_to_use.print(f"[{Colors.WARNING}] Invalid dist_region_id {dist_region_id} derived from order in recent_distributor_orders_by_drug (Manu Obs): {order}")
+                except (ValueError, TypeError, KeyError) as e:
+                    if console_to_use:
+                        console_to_use.print(f"[{Colors.WARNING}] Skipping invalid order in recent_distributor_orders_by_drug calculation (Manu Obs): {order} - Error: {e}[/{Colors.WARNING}]")
         obs["recent_distributor_orders_by_drug"] = {k: dict(v) for k,v in obs["recent_distributor_orders_by_drug"].items()}
+        # Ensure all drugs/regions are present in recent_distributor_orders_by_drug with empty lists if no orders
+        for d_id_str_key in obs.get("drug_info", {}).keys():
+            if d_id_str_key not in obs["recent_distributor_orders_by_drug"]:
+                obs["recent_distributor_orders_by_drug"][d_id_str_key] = {}
+            for r_id_key in range(sim.num_regions):
+                r_id_str_key = str(r_id_key)
+                if r_id_str_key not in obs["recent_distributor_orders_by_drug"].get(d_id_str_key, {}):
+                    # Ensure the drug key exists before trying to add a region key to its dictionary value
+                    if d_id_str_key not in obs["recent_distributor_orders_by_drug"]:
+                        obs["recent_distributor_orders_by_drug"][d_id_str_key] = {} # Initialize drug key if totally missing
+                    obs["recent_distributor_orders_by_drug"][d_id_str_key][r_id_str_key] = []
+
+
+        # --- Pre-calculate `sum_recent_distributor_orders` (for Manufacturer's production tool) ---
+        obs["sum_recent_distributor_orders"] = defaultdict(float)
+        # current_day_int_for_filter is already defined above
+        # *** MODIFICATION HERE: Only include orders from *before* the current_day ***
+        # For a 3-day lookback EXCLUDING the current day:
+        # e.g., if current_day_int_for_filter is 1 (Day 2), we look at Day 0, -1, -2.
+        # Max lookback_day is current_day_int_for_filter - 1
+        # Min lookback_day is current_day_int_for_filter - 3
+        max_lookback_day = current_day_int_for_filter - 1
+        min_lookback_day = current_day_int_for_filter - 3
+
+        for order in sim.order_history:
+            order_day = order.get("day", -99) # Use a default far in the past if "day" is missing
+            if order.get("to_id") == 0 and \
+               min_lookback_day <= order_day <= max_lookback_day: # Check if order_day is in the lookback window
+                try:
+                    drug_id_str = str(order["drug_id"])
+                    amount = float(order["amount"])
+                    obs["sum_recent_distributor_orders"][drug_id_str] += amount
+                except (ValueError, TypeError, KeyError) as e: 
+                    if console_to_use: 
+                        console_to_use.print(f"[{Colors.WARNING}] Skipping invalid order in sum_recent_distributor_orders calculation (Manu Obs): {order} - Error: {e}[/{Colors.WARNING}]")
+        obs["sum_recent_distributor_orders"] = dict(obs["sum_recent_distributor_orders"]) 
+        for d_id_str_key in obs.get("drug_info", {}).keys():
+            if d_id_str_key not in obs["sum_recent_distributor_orders"]:
+                obs["sum_recent_distributor_orders"][d_id_str_key] = 0.0
+        
+
 
     elif agent_type == "distributor":
         region_id = agent_id_param
@@ -301,6 +356,33 @@ def format_observation_for_agent(
                      for day_offset in range(0, 7)] # Forecast for its hospital, 7 days starting today
             for d in range(sim.num_drugs)
         }
+        obs["dist_obs_demand_over_planning_horizon"] = defaultdict(float)
+        obs["dist_obs_avg_daily_demand_in_horizon"] = defaultdict(float)
+        
+        ORDER_LEAD_TIME_DAYS_DIST = 5 # Must match LLM prompt if hardcoded there
+        ORDER_REVIEW_PERIOD_DAYS_DIST = 1
+        PLANNING_HORIZON_ORDER_DAYS_DIST = ORDER_LEAD_TIME_DAYS_DIST + ORDER_REVIEW_PERIOD_DAYS_DIST
+
+        current_day_int_for_filter = int(current_day) # Ensure current_day is int
+
+        for d_id_str in obs.get("drug_info", {}).keys():
+            drug_id = int(d_id_str)
+            hosp_fcst_list_for_drug = obs.get("downstream_hospital_demand_forecast", {}).get(d_id_str, [])
+            
+            # Fallback if forecast is empty or too short
+            if not hosp_fcst_list_for_drug or len(hosp_fcst_list_for_drug) < PLANNING_HORIZON_ORDER_DAYS_DIST:
+                # Use projected demand today for this hospital as fallback
+                proj_demand_today_val = obs.get("epidemiological_data", {}).get("projected_demand", {}).get(d_id_str, 0.0)
+                hosp_fcst_relevant_period = [proj_demand_today_val] * PLANNING_HORIZON_ORDER_DAYS_DIST
+            else:
+                hosp_fcst_relevant_period = [float(val) for val in hosp_fcst_list_for_drug[:PLANNING_HORIZON_ORDER_DAYS_DIST]]
+
+            obs["dist_obs_demand_over_planning_horizon"][d_id_str] = sum(hosp_fcst_relevant_period)
+            obs["dist_obs_avg_daily_demand_in_horizon"][d_id_str] = \
+                sum(hosp_fcst_relevant_period) / max(1, len(hosp_fcst_relevant_period))
+        
+        obs["dist_obs_demand_over_planning_horizon"] = dict(obs["dist_obs_demand_over_planning_horizon"])
+        obs["dist_obs_avg_daily_demand_in_horizon"] = dict(obs["dist_obs_avg_daily_demand_in_horizon"])
 
     elif agent_type == "hospital":
         region_id = agent_id_param
@@ -339,6 +421,44 @@ def format_observation_for_agent(
             
             obs["recent_actual_demand"][d_id_str] = round(np.mean(demands_for_drug),1) if demands_for_drug else \
                                                    round(base_demand_val * (current_cases_val / 100.0), 1)
+
+        obs["hosp_obs_demand_sum_planning_horizon"] = defaultdict(float)
+        obs["hosp_obs_avg_daily_demand_in_horizon"] = defaultdict(float)
+        obs["hosp_obs_smoothed_daily_demand_signal"] = defaultdict(float)
+
+        ORDER_LEAD_TIME_DAYS_HOSP = 3 # Must match LLM prompt
+        ORDER_REVIEW_PERIOD_DAYS_HOSP = 1
+        PLANNING_HORIZON_DAYS_HOSP = ORDER_LEAD_TIME_DAYS_HOSP + ORDER_REVIEW_PERIOD_DAYS_HOSP
+        SMOOTHING_FACTOR_HOSP = 0.4 # Must match LLM prompt
+
+        current_day_int_for_filter = int(current_day) # Ensure current_day is int
+
+        for d_id_str in obs.get("drug_info", {}).keys():
+            drug_id = int(d_id_str)
+            # Use the existing daily_demand_forecast_list_for_my_needs from obs
+            my_demand_fcst_list = obs.get("daily_demand_forecast_list_for_my_needs", {}).get(d_id_str, [])
+            
+            if not my_demand_fcst_list or len(my_demand_fcst_list) < PLANNING_HORIZON_DAYS_HOSP:
+                proj_demand_today_val = obs.get("epidemiological_data", {}).get("projected_demand", {}).get(d_id_str, 0.0)
+                demand_forecast_planning_horizon_hosp = [proj_demand_today_val] * PLANNING_HORIZON_DAYS_HOSP
+            else:
+                demand_forecast_planning_horizon_hosp = [float(val) for val in my_demand_fcst_list[:PLANNING_HORIZON_DAYS_HOSP]]
+
+            obs["hosp_obs_demand_sum_planning_horizon"][d_id_str] = sum(demand_forecast_planning_horizon_hosp)
+            avg_daily_demand_horizon_hosp = sum(demand_forecast_planning_horizon_hosp) / max(1, len(demand_forecast_planning_horizon_hosp))
+            obs["hosp_obs_avg_daily_demand_in_horizon"][d_id_str] = avg_daily_demand_horizon_hosp
+            
+            # Calculate smoothed demand signal
+            recent_actual_demand_val_hosp = float(obs.get("recent_actual_demand", {}).get(d_id_str, 0.0))
+            smoothed_signal = (recent_actual_demand_val_hosp * SMOOTHING_FACTOR_HOSP) + \
+                              (avg_daily_demand_horizon_hosp * (1 - SMOOTHING_FACTOR_HOSP))
+            smoothed_signal = max(smoothed_signal, avg_daily_demand_horizon_hosp * 0.5) # Floor
+            obs["hosp_obs_smoothed_daily_demand_signal"][d_id_str] = smoothed_signal
+
+        obs["hosp_obs_demand_sum_planning_horizon"] = dict(obs["hosp_obs_demand_sum_planning_horizon"])
+        obs["hosp_obs_avg_daily_demand_in_horizon"] = dict(obs["hosp_obs_avg_daily_demand_in_horizon"])
+        obs["hosp_obs_smoothed_daily_demand_signal"] = dict(obs["hosp_obs_smoothed_daily_demand_signal"])
+
 
 
     # Add active disruptions relevant to this agent/location

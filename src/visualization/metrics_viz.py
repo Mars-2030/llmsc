@@ -350,40 +350,37 @@ def visualize_blockchain_performance(
          if console: console.print(f"[bold {getattr(Colors, 'RED', 'red')}]Error saving blockchain performance visualization: {e}[/bold {getattr(Colors, 'RED', 'red')}]")
 
 
-def calculate_bullwhip_effect(environment_history: Dict[str, Any]) -> Optional[Dict[str, float]]:
+def calculate_bullwhip_effect(environment_history: Dict[str, Any], num_regions: int) -> Optional[Dict[str, float]]: # num_regions IS a parameter
     """
-    Calculates bullwhip effect. Takes the 'environment_history' dictionary.
+    Calculates bullwhip effect. Takes the 'environment_history' dictionary and num_regions.
     """
-    # This function's internal logic should remain the same, as it operates
-    # on the history lists provided in environment_history.
-    # Just ensure these lists (demand_history, order_history, production_history)
-    # are correctly populated by the SimPy simulation.
-
     demand_hist = environment_history.get("demand_history", [])
     order_hist = environment_history.get("order_history", [])
-    # Assuming production_history logs actual production amounts suitable for variance calc
     prod_hist = environment_history.get("production_history", [])
     sim_length = environment_history.get("scenario_length", 0)
 
-    if not demand_hist or not order_hist or sim_length < 5: # Need some data
+    if not demand_hist or not order_hist or sim_length < 5:
         return None
 
-    daily_demand = defaultdict(float) # Total demand at hospitals (final customer)
-    daily_hosp_orders = defaultdict(float) # Orders from hospitals to distributors
-    daily_dist_orders = defaultdict(float) # Orders from distributors to manufacturer
-    daily_manu_prod = defaultdict(float)   # Production by manufacturer
+    daily_demand = defaultdict(float)
+    daily_hosp_orders = defaultdict(float)
+    daily_dist_orders = defaultdict(float)
+    daily_manu_prod = defaultdict(float)
 
-    for event in demand_hist: # Assuming this is hospital demand on simulation
+    for event in demand_hist:
         if isinstance(event, dict): daily_demand[event.get('day',-1)] += event.get('demand',0.0)
+
     for event in order_hist:
         if isinstance(event, dict):
             if event.get('to_id') == 0: # Order TO Manufacturer (from Distributor)
                 daily_dist_orders[event.get('day',-1)] += event.get('amount',0.0)
-            elif event.get('from_id',-1) > sim_object.num_regions and event.get('to_id',-1) <= sim_object.num_regions and event.get('to_id',-1) != 0 : # Order TO Distributor (from Hospital)
+            # *** CORRECTED LINE: Use the 'num_regions' parameter ***
+            elif event.get('from_id',-1) > num_regions and event.get('to_id',-1) <= num_regions and event.get('to_id',-1) != 0 : # Order TO Distributor (from Hospital)
                 # from_id > num_regions means it's a hospital (e.g. num_regions+1 to 2*num_regions)
                 # to_id <= num_regions AND !=0 means it's a distributor (1 to num_regions)
                 daily_hosp_orders[event.get('day',-1)] += event.get('amount',0.0)
-    for event in prod_hist: # Assuming production_history has "amount_produced"
+
+    for event in prod_hist:
         if isinstance(event, dict): daily_manu_prod[event.get('day',-1)] += event.get('amount_produced',0.0)
 
     days_range = range(sim_length)
@@ -393,23 +390,27 @@ def calculate_bullwhip_effect(environment_history: Dict[str, Any]) -> Optional[D
     df['DistOrders'] = [daily_dist_orders.get(d, 0) for d in days_range]
     df['ManuProd'] = [daily_manu_prod.get(d, 0) for d in days_range]
 
-    # Variances (add epsilon for stability if variance is zero)
     epsilon = 1e-9
-    var_demand = df['HospDemand'].var(); var_demand = epsilon if var_demand <=0 else var_demand
-    var_hosp_orders = df['HospOrders'].var(); var_hosp_orders = epsilon if var_hosp_orders <=0 else var_hosp_orders
-    var_dist_orders = df['DistOrders'].var(); var_dist_orders = epsilon if var_dist_orders <=0 else var_dist_orders
-    var_manu_prod = df['ManuProd'].var(); var_manu_prod = epsilon if var_manu_prod <=0 else var_manu_prod
-    
-    # Ensure all variances are not None before division
-    if any(v is None for v in [var_demand, var_hosp_orders, var_dist_orders, var_manu_prod]):
+    # Ensure variance is calculated correctly and handle potential NaN or zero variance
+    var_demand_val = df['HospDemand'].var(); var_demand = epsilon if pd.isna(var_demand_val) or var_demand_val <= epsilon else var_demand_val
+    var_hosp_orders_val = df['HospOrders'].var(); var_hosp_orders = epsilon if pd.isna(var_hosp_orders_val) or var_hosp_orders_val <= epsilon else var_hosp_orders_val
+    var_dist_orders_val = df['DistOrders'].var(); var_dist_orders = epsilon if pd.isna(var_dist_orders_val) or var_dist_orders_val <= epsilon else var_dist_orders_val
+    var_manu_prod_val = df['ManuProd'].var(); var_manu_prod = epsilon if pd.isna(var_manu_prod_val) or var_manu_prod_val <= epsilon else var_manu_prod_val
+
+    # Check again after epsilon application if any became None (unlikely but safety)
+    if var_demand is None or var_hosp_orders is None or var_dist_orders is None or var_manu_prod is None:
         return None
 
+    # Avoid division by zero if a variance is still effectively zero after epsilon
+    bw_hosp_orders_demand = var_hosp_orders / var_demand if var_demand > epsilon else float('inf')
+    bw_dist_orders_hosp = var_dist_orders / var_hosp_orders if var_hosp_orders > epsilon else float('inf')
+    bw_manu_prod_dist = var_manu_prod / var_dist_orders if var_dist_orders > epsilon else float('inf')
+    
     return {
-        "Hospital Orders / Demand": var_hosp_orders / var_demand,
-        "Distributor Orders / Hosp Orders": var_dist_orders / var_hosp_orders,
-        "Manufacturer Prod / Dist Orders": var_manu_prod / var_dist_orders,
+        "Hospital Orders / Demand": bw_hosp_orders_demand,
+        "Distributor Orders / Hosp Orders": bw_dist_orders_hosp,
+        "Manufacturer Prod / Dist Orders": bw_manu_prod_dist,
     }
-
 
 def visualize_costs(environment_history: Dict[str, Any], output_folder="output", console=None):
     """Visualize daily and cumulative costs over time from environment_history."""

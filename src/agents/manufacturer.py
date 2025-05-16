@@ -106,8 +106,8 @@ class ManufacturerAgentLG:
 
         tools_for_prompt = (
             "Available Tools:\n\n"
-            "1.  **`calculate_target_production_quantities` (Primary for Production):** Call this ONCE. You MUST construct its arguments carefully as per instructions and schema.\n"
-            "    Required args include `current_inventories`, `pending_releases_soon`, `warehouse_inventories`, `sum_recent_orders`, `total_downstream_demand_forecast_list`, `any_downstream_stockouts`, and `observation_subset` (which must contain `production_capacity` and full `drug_info`).\n\n"
+            "1.  **`calculate_target_production_quantities` (Primary for Production):** Call this ONCE. You MUST construct its arguments carefully as per instructions and schema. The `sum_recent_orders` argument will use the pre-calculated `obs_clean.sum_recent_distributor_orders` field.\n"
+            "    Required args include `current_inventories`, `pending_releases_soon`, `warehouse_inventories`, `sum_recent_orders` (use `obs_clean.sum_recent_distributor_orders`), `total_downstream_demand_forecast_list`, `any_downstream_stockouts`, and `observation_subset` (which must contain `production_capacity` and full `drug_info`).\n\n"
             "2.  `get_blockchain_regional_cases` (Optional, for Allocation Context if scarce and high criticality regions exist): Fetches trusted regional case counts.\n\n"
             "3.  `calculate_allocation_priority` (Optional, for Complex Allocation under Scarcity): Helps prioritize if simple proportional allocation (Step 3.3 in scratchpad) seems insufficient. Requires `drug_id`, `region_requests`, `available_inventory`, AND THE `drug_info` OBJECT for the specific drug (extracted from `obs_clean.drug_info`).\n\n"
             "*Tool Call Order:* First, `calculate_target_production_quantities` for production. Then, proceed to allocation logic (Step 3 in scratchpad). Only use allocation tools if Step 3.3 logic is clearly inadequate for a highly contested, critical drug.\n"
@@ -121,7 +121,7 @@ You must provide the following arguments to this tool, correctly formatted:
     - `current_inventories`: {{ "drug_id_str": quantity_float, ... }}
     - `pending_releases_soon`: {{ "drug_id_str": qty, ... }}
     - `warehouse_inventories`: {{ "drug_id_str": qty, ... }}
-    - `sum_recent_orders`: {{ "drug_id_str": total_quantity_float, ... }}
+    - `sum_recent_orders`: Use the pre-calculated `obs_clean.sum_recent_distributor_orders` dictionary directly for this argument.
     - `total_downstream_demand_forecast_list`: {{ "drug_id_str": [fcst_day1_float, ...], ... }}
     - `any_downstream_stockouts`: {{ "drug_id_str": boolean_value, ... }}
 2.  **`observation_subset`** (a dictionary containing key data extracted from `obs_clean`):
@@ -137,7 +137,7 @@ Follow the scratchpad carefully to construct these arguments in a variable like 
 SYSTEM
 You are the **{agent}**. Your primary goals are to maintain supply chain resilience through proactive production and to perform fair, daily allocations. Prioritize regions with severe stockouts, high patient impact, or high criticality needs.
 Your Decision Process:
-1.  **Prepare Production Inputs (Scratchpad Part 1):** Analyze the `Current observation` (referred to as `obs_clean` in scratchpad).
+1.  **Prepare Production Inputs (Scratchpad Part 1):** Analyze the `Current observation` (referred to as `obs_clean` in scratchpad). Note that `sum_recent_orders` is now directly available as `obs_clean.sum_recent_distributor_orders`.
     {production_tool_arg_instructions}
     Calculate dynamic target cover days for production, considering overall trends, downstream stockouts, and system-wide patient impact (`obs_clean.system_wide_patient_impact_summary`).
 2.  **Determine Production (Scratchpad Part 2):** Call the `calculate_target_production_quantities` tool ONCE using the fully constructed arguments from Step 1. Use its output for your `manufacturer_production` decision unless the tool call fails (then use a simple fallback).
@@ -157,7 +157,7 @@ Current observation (JSON string, referred to as 'obs_clean' in scratchpad):
 # === Part 1: Prepare Inputs for `calculate_target_production_quantities` tool ===
 # This section MUST correctly populate all required arguments for the tool.
 `tool_arg_current_inventories` = {{}}; `tool_arg_pending_releases_soon` = {{}};
-`tool_arg_warehouse_inventories` = {{}}; `tool_arg_sum_recent_orders` = {{}};
+`tool_arg_warehouse_inventories` = {{}};
 `tool_arg_any_downstream_stockouts` = {{}};
 `current_day_for_calc` = int(obs_clean.day); 
 
@@ -172,12 +172,7 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
             `sum_pending_val_prod` += float(r_entry.get("amount", 0.0))
     `tool_arg_pending_releases_soon[d_id_str]` = `sum_pending_val_prod`
 
-For each `d_id_str` in `obs_clean.drug_info.keys()`:
-    `sum_for_drug_orders` = 0.0
-    if d_id_str in obs_clean.recent_distributor_orders_by_drug:
-        for r_id_str, order_list_val in obs_clean.recent_distributor_orders_by_drug[d_id_str].items():
-            if isinstance(order_list_val, list): sum_for_drug_orders += sum(float(o) for o in order_list_val if isinstance(o, (int,float, np.number)))
-    `tool_arg_sum_recent_orders[d_id_str]` = sum_for_drug_orders
+# `sum_recent_orders` is now directly available as `obs_clean.sum_recent_distributor_orders`.
 
 For each `d_id_str` in `obs_clean.drug_info.keys()`:
     `stockouts_dict_for_drug` = obs_clean.downstream_stockout_summary.get(d_id_str, {{}})
@@ -185,7 +180,7 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
 
 `tool_arg_observation_subset` = {{
     "production_capacity": obs_clean.production_capacity,
-    "drug_info": obs_clean.drug_info // Pass the full drug_info from observation
+    "drug_info": obs_clean.drug_info 
 }}
 
 `base_target_cover_days` = 7
@@ -207,7 +202,7 @@ elif `max_patient_impact_overall` > 500: `tool_stockout_boost_factor_to_pass_val
     "current_inventories": `tool_arg_current_inventories`,
     "pending_releases_soon": `tool_arg_pending_releases_soon`,
     "warehouse_inventories": `tool_arg_warehouse_inventories`,
-    "sum_recent_orders": `tool_arg_sum_recent_orders`,
+    "sum_recent_orders": obs_clean.sum_recent_distributor_orders, # *** USE PRE-CALCULATED VALUE ***
     "total_downstream_demand_forecast_list": obs_clean.total_downstream_demand_forecast,
     "any_downstream_stockouts": `tool_arg_any_downstream_stockouts`,
     "observation_subset": `tool_arg_observation_subset`
@@ -231,6 +226,7 @@ Else:
          `manufacturer_production[d_id_str_fb]` = `min(max(df_fb_val * 1.5, cap_fb_val * 0.01), cap_fb_val * 0.15)`
 
 # === Part 3: Allocation Planning ===
+# ... (Allocation logic remains the same as previously provided) ...
 `manufacturer_allocation` = {{}}; `alloc_method_reason` = "Proportional based on weighted need."
 For each `d_id_str_alloc_init` in `obs_clean.drug_info.keys()`: `manufacturer_allocation[d_id_str_alloc_init]` = {{}}
 
@@ -258,8 +254,41 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
         `hosp_forecast_for_region_drug_alloc` = obs_clean.regional_hospital_demand_forecast.get(d_id_str, {{}}).get(r_id_str_alloc_loop, [])
         `sum_hosp_forecast_for_alloc_calc` = sum(float(f) for f in `hosp_forecast_for_region_drug_alloc`[:3] if isinstance(f, (int, float, np.number)))
 
+        # Sum recent orders from this distributor based on obs_clean.sum_recent_distributor_orders,
+        # but for allocation, we need the specific orders TO this distributor, not the sum.
+        # The original Manufacturer logic used obs_clean.recent_distributor_orders_by_drug for this,
+        # which is fine, as it's about requests *from* distributors.
+        # If we want to use the pre-calculated total sum, it's for production planning, not this specific regional allocation.
+        # So, for allocation, it's better to look at what distributors *requested* if that data is available (though the LLM's scratchpad for allocation here relies more on downstream hospital projected demand and forecast)
+
+        # Using the existing logic:
+        `recent_orders_from_this_dist_list_alloc` = [] # Placeholder if we stick to existing obs fields for allocation.
+                                                        # If using `obs_clean.sum_recent_distributor_orders` for *this step*, it would need to be apportioned,
+                                                        # or we use a different observation field for this regional allocation (e.g., direct dist requests if available)
+                                                        # The prompt implies the Manufacturer's allocation decision is based on a combination of
+                                                        # hospital demand, stockouts, and overall patient impact, not *just* what distributors ordered.
+                                                        # The current obs provides `obs_clean.recent_distributor_orders_by_drug` which would be raw.
+                                                        # For simplicity for the LLM here for allocation, let's assume it focuses on downstream hospital need.
+                                                        # If direct distributor requests were in `obs_clean.sum_recent_distributor_orders` (which they are),
+                                                        # the LLM could be instructed to parse that for *allocation requests* too, but the current scratchpad does not.
+                                                        # It uses hospital projections as a proxy.
+
+        # For now, let's assume the LLM is to use the hospital projected demand + forecast for allocation needs.
+        # If `obs_clean.sum_recent_distributor_orders` contained *per-region* sums of what *that specific distributor ordered*, it could be used.
+        # Since it's a total sum across all distributors for a drug, it's less useful for region-specific allocation here without further breakdown.
+        # The original scratchpad uses `sum_hosp_forecast_for_alloc_calc` and `hosp_proj_demand_today_alloc`.
+        
+        # This `sum_recent_dist_orders_for_region_alloc` was derived from `obs_clean.recent_distributor_orders_by_drug` previously.
+        # If `obs_clean.recent_distributor_orders_by_drug` is removed from obs, the LLM cannot calculate this.
+        # So either:
+        # 1. Keep `obs_clean.recent_distributor_orders_by_drug` in the observation for the LLM to parse for this allocation step.
+        # 2. Or, pre-calculate `sum_recent_dist_orders_for_region_alloc` in Python for each drug/region and add to obs.
+        # Let's assume option 1 for now for minimal changes to this allocation part of the scratchpad, meaning format_observation_for_agent should still provide `obs["recent_distributor_orders_by_drug"]`
+        # If that field was removed (as suggested "Optional, but good practice" in the python pre-calc step), then this scratchpad line will fail.
+        # For now, assuming `obs_clean.recent_distributor_orders_by_drug` is still available to the LLM.
         `recent_orders_from_this_dist_list_alloc` = obs_clean.recent_distributor_orders_by_drug.get(d_id_str, {{}}).get(r_id_str_alloc_loop, [])
         `sum_recent_dist_orders_for_region_alloc` = sum(float(o) for o in `recent_orders_from_this_dist_list_alloc` if isinstance(o, (int, float, np.number)))
+
 
         `region_base_need_alloc` = max(`sum_hosp_forecast_for_alloc_calc`, `sum_recent_dist_orders_for_region_alloc`, `hosp_proj_demand_today_alloc`)
         `region_base_need_alloc` = max(0.0, `region_base_need_alloc`)
@@ -288,23 +317,21 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
 
     `total_weighted_need_for_drug_alloc` = sum(internal_weighted_needs_alloc.values())
     
-    `drug_crit_val_alloc` = int(obs_clean.drug_info.get(d_id_str, {{}}).get("criticality_value", 1)) # Ensure correct key for criticality value
+    `drug_crit_val_alloc` = int(obs_clean.drug_info.get(d_id_str, {{}}).get("criticality_value", 1))
     `use_advanced_alloc_tool` = False
     if `drug_crit_val_alloc` >= 3 and `total_weighted_need_for_drug_alloc` > `current_usable_inv_for_alloc_calc` * 1.2:
         `use_advanced_alloc_tool` = True
         `alloc_method_reason` = "Advanced allocation tool due to scarcity of critical drug."
 
     if `use_advanced_alloc_tool`:
-        `alloc_tool_drug_info_arg` = obs_clean.drug_info.get(d_id_str) # Get the specific drug_info object
+        `alloc_tool_drug_info_arg` = obs_clean.drug_info.get(d_id_str) 
         `alloc_tool_region_requests_arg` = {{r_id_str: float(internal_weighted_needs_alloc.get(r_id_str,0.0)) for r_id_str in all_region_ids_obs_alloc}}
         `alloc_tool_args` = {{
             "drug_id": int(d_id_str),
             "region_requests": `alloc_tool_region_requests_arg`,
             "available_inventory": `current_usable_inv_for_alloc_calc`,
-            "drug_info": `alloc_tool_drug_info_arg` // THIS IS THE CRITICAL PART
+            "drug_info": `alloc_tool_drug_info_arg`
         }}
-        // Optional: if get_blockchain_regional_cases was called, add `region_cases` to `alloc_tool_args`
-        // if `blockchain_cases_data` exists: `alloc_tool_args["region_cases"]` = `blockchain_cases_data`
         
         `advanced_alloc_result` = Call `calculate_allocation_priority` with `alloc_tool_args`.
         if isinstance(`advanced_alloc_result`, dict) and "error" not in `advanced_alloc_result`:

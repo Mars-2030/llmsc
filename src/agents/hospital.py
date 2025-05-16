@@ -103,7 +103,7 @@ class HospitalAgentLG:
 
         prompt = f"""
 You are the {agent_name} in a pandemic supply chain simulation on Day {current_day+1}.
-Primary goal: Ensure drug **availability** for patients by maintaining adequate inventory buffers based on **smoothed demand signals**, **criticality assessments**, and **patient impact score** (`obs_clean.my_region_patient_impact_score`).
+Primary goal: Ensure drug **availability** for patients by maintaining adequate inventory buffers based on **smoothed demand signals** (available as `obs_clean.hosp_obs_smoothed_daily_demand_signal`), **criticality assessments**, and **patient impact score** (`obs_clean.my_region_patient_impact_score`).
 
 **My Recent History Summary:**
 {memory_summary}
@@ -112,7 +112,7 @@ Primary goal: Ensure drug **availability** for patients by maintaining adequate 
 {obs_summary_str}
 
 **Your Process:**
-1.  Analyze situation: Check inventory (`obs_clean.inventories`), pipeline (`obs_clean.inbound_pipeline`), `obs_clean.epidemiological_data` (cases, trend, projected demand for my region), `obs_clean.recent_actual_demand`, `obs_clean.stockout_history`, and `obs_clean.my_region_patient_impact_score`.
+1.  Analyze situation: Check inventory (`obs_clean.inventories`), pipeline (`obs_clean.inbound_pipeline`), `obs_clean.epidemiological_data` (cases, trend, projected demand for my region), `obs_clean.recent_actual_demand`, `obs_clean.stockout_history`, and `obs_clean.my_region_patient_impact_score`. Key pre-calculated demand signals for your ordering decision are `obs_clean.hosp_obs_demand_sum_planning_horizon`, `obs_clean.hosp_obs_avg_daily_demand_in_horizon`, and especially `obs_clean.hosp_obs_smoothed_daily_demand_signal`.
 2.  Identify information needs: Is inventory low for critical drugs? Is patient impact high? If yes, call `get_criticality_assessment`.
 3.  {tool_guidance}
 4.  **Determine final order quantities using Robust Resilient Ordering Logic (see scratchpad).** Adjust safety stock targets based on demand trend, stockouts, and patient impact.
@@ -126,26 +126,24 @@ Primary goal: Ensure drug **availability** for patients by maintaining adequate 
 # `my_inv[drug_id_str]` = float(obs_clean.inventories.get(drug_id_str, 0.0))
 # `pipeline_to_me[drug_id_str]` = float(obs_clean.inbound_pipeline.get(drug_id_str, 0.0))
 # `my_epi_data` = obs_clean.epidemiological_data # Specific to my region
-# `proj_demand_today[drug_id_str]` = float(my_epi_data.get("projected_demand", {{}}).get(drug_id_str, 0.0))
+# `proj_demand_today[drug_id_str]` = float(my_epi_data.get("projected_demand", {{}}).get(drug_id_str, 0.0)) # Still useful context
 # `case_trend` = my_epi_data.get("case_trend_category", "stable")
 # `current_cases` = int(my_epi_data.get("current_active_cases", 0))
-# `my_demand_forecast_list[drug_id_str]` = obs_clean.daily_demand_forecast_list_for_my_needs.get(drug_id_str, [`proj_demand_today[drug_id_str]`]*7) # 7-day forecast for my needs
-# `recent_actual_demand_val[drug_id_str]` = float(obs_clean.recent_actual_demand.get(drug_id_str, 0.0))
-# `stockout_hist_list_for_drug[drug_id_str]` = [s for s in obs_clean.stockout_history if str(s.get("drug_id")) == drug_id_str] # Filter for current drug
+# `my_demand_forecast_list[drug_id_str]` = obs_clean.daily_demand_forecast_list_for_my_needs.get(drug_id_str, [`proj_demand_today[d_id_str]`]*7) # Contextual
+# `recent_actual_demand_val[drug_id_str]` = float(obs_clean.recent_actual_demand.get(drug_id_str, 0.0)) # Contextual
+# `stockout_hist_list_for_drug[drug_id_str]` = [s for s in obs_clean.stockout_history if str(s.get("drug_id")) == drug_id_str] 
 # `stockout_days_for_drug[drug_id_str]` = len(set(s.get('day') for s in stockout_hist_list_for_drug[drug_id_str]))
 # `my_current_region_impact_score` = float(obs_clean.my_region_patient_impact_score)
 
 # --- Step 4: Robust Resilient Ordering Logic (per drug_id_str) ---
 `hospital_orders` = {{}}
-`ORDER_LEAD_TIME_DAYS` = 3 # Assumed average lead time from my distributor
-`ORDER_REVIEW_PERIOD_DAYS` = 1 # Daily review
-`PLANNING_HORIZON_DAYS` = `ORDER_LEAD_TIME_DAYS` + `ORDER_REVIEW_PERIOD_DAYS` # = 4
+`PLANNING_HORIZON_DAYS` = 4 # Assumed average lead time from my distributor (3 days) + Daily review (1 day)
 `BASE_SAFETY_STOCK_DAYS` = 5
 `MAX_ORDER_MULTIPLE_OF_HORIZON_DEMAND` = 3.0
 `MIN_ORDER_FACTOR_AVG_DEMAND` = 0.25
 
 For each `d_id_str` in `obs_clean.drug_info.keys()`:
-    `drug_crit_val` = int(obs_clean.drug_info.get(d_id_str, {{}}).get("criticality_value", 1)) # Get criticality value
+    `drug_crit_val` = int(obs_clean.drug_info.get(d_id_str, {{}}).get("criticality_value", 1))
     `current_safety_days` = `BASE_SAFETY_STOCK_DAYS`
     `order_urgency_boost` = 1.0
 
@@ -161,21 +159,17 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
 
     `current_safety_days` = min(max(2.0, `current_safety_days`), 12.0) // Bounds for safety days
 
-    // Use the provided multi-day forecast for planning horizon demand
-    `demand_forecast_planning_horizon` = `my_demand_forecast_list[d_id_str]`[:`PLANNING_HORIZON_DAYS`]
-    if not `demand_forecast_planning_horizon` or len(`demand_forecast_planning_horizon`) < `PLANNING_HORIZON_DAYS`: # Fallback if forecast too short
-        `demand_forecast_planning_horizon` = [`proj_demand_today[d_id_str]`] * `PLANNING_HORIZON_DAYS`
-        
-    `demand_sum_planning_horizon` = sum(`demand_forecast_planning_horizon`)
-    `avg_daily_demand_horizon` = `demand_sum_planning_horizon` / max(1, len(`demand_forecast_planning_horizon`))
-
-    // More responsive smoothed demand: weighted average of recent actual and projected
-    `smoothing_factor` = 0.4 # Weight for recent actual demand
-    `smoothed_daily_demand_signal` = (`recent_actual_demand_val[d_id_str]` * `smoothing_factor`) + (`avg_daily_demand_horizon` * (1 - `smoothing_factor`))
-    `smoothed_daily_demand_signal` = max(`smoothed_daily_demand_signal`, `avg_daily_demand_horizon` * 0.5) # Floor at 50% of avg forecast
+    // *** USE PRE-CALCULATED DEMAND SIGNALS FROM OBSERVATION ***
+    // `demand_sum_planning_horizon` = float(obs_clean.hosp_obs_demand_sum_planning_horizon.get(d_id_str, 0.0)) // Not directly needed if using smoothed_daily_demand_signal for horizon demand
+    // `avg_daily_demand_horizon` = float(obs_clean.hosp_obs_avg_daily_demand_in_horizon.get(d_id_str, 0.0)) // Not directly needed if using smoothed_daily_demand_signal
+    `smoothed_daily_demand_signal` = float(obs_clean.hosp_obs_smoothed_daily_demand_signal.get(d_id_str, 0.0))
+    // *** END PRE-CALCULATED USAGE ***
 
     `safety_stock_units_calculated` = `smoothed_daily_demand_signal` * `current_safety_days`
-    `order_up_to_target` = (`smoothed_daily_demand_signal` * `PLANNING_HORIZON_DAYS`) + `safety_stock_units_calculated`
+    // Demand over horizon is now based on the smoothed signal for consistency
+    `demand_over_horizon_using_smoothed` = `smoothed_daily_demand_signal` * `PLANNING_HORIZON_DAYS`
+    `order_up_to_target` = `demand_over_horizon_using_smoothed` + `safety_stock_units_calculated`
+    
     `current_inventory_position` = `my_inv[d_id_str]` + `pipeline_to_me[d_id_str]`
     
     `calculated_order` = `order_up_to_target` - `current_inventory_position`
@@ -185,7 +179,6 @@ For each `d_id_str` in `obs_clean.drug_info.keys()`:
     if `calculated_order` > 0.01:
         `min_order_trigger` = max(1.0, `smoothed_daily_demand_signal` * `MIN_ORDER_FACTOR_AVG_DEMAND`)
         `final_order_quantity` = max(`calculated_order`, `min_order_trigger`)
-        // Cap order to a multiple of horizon demand to prevent excessive ordering
         `final_order_quantity` = min(`final_order_quantity`, `smoothed_daily_demand_signal` * `PLANNING_HORIZON_DAYS` * `MAX_ORDER_MULTIPLE_OF_HORIZON_DEMAND`)
         `hospital_orders[d_id_str]` = round(max(0.0, `final_order_quantity`))
 
